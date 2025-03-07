@@ -1,3 +1,0 @@
-E:/Workplace/Vctrl/build/CMakeFiles/vJoyApp.dir
-E:/Workplace/Vctrl/build/CMakeFiles/edit_cache.dir
-E:/Workplace/Vctrl/build/CMakeFiles/rebuild_cache.dir
