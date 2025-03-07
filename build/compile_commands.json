@@ -1,0 +1,8 @@
+[
+{
+  "directory": "E:/Workplace/Vctrl/build",
+  "command": "C:\\MinGW\\bin\\g++.exe  @CMakeFiles/vJoyApp.dir/includes_CXX.rsp -g -std=gnu++11 -o CMakeFiles\\vJoyApp.dir\\src\\main.cpp.obj -c E:\\Workplace\\Vctrl\\src\\main.cpp",
+  "file": "E:/Workplace/Vctrl/src/main.cpp",
+  "output": "CMakeFiles/vJoyApp.dir/src/main.cpp.obj"
+}
+]
