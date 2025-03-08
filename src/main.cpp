@@ -33,14 +33,181 @@
 
 int DEV_USABLE = 1;
 
-HWND hLogBox;
 
+#pragma region Declaration
+enum class InputActType
+{
+    Button, AxisMove
+};
+struct InputAct
+{
+    int butID;
+    bool isPressed;
+    InputActType type;
+};
+std::queue<InputAct> inputQue;
+std::mutex inputQueMutex;
+std::condition_variable inputCV;
+bool inputThreadRunning;
+int CheckVJD(int dev_id);
+void PushAction(const InputAct& Act);
+void workThreadFunc();
+void ActionProc(InputAct Act);
+void ResettVJD(int dev_id);
+
+
+HWND hLogBox;
 std::queue<std::string> logBuff;//消息缓冲区
-std::mutex logMutex;//线程锁
+std::mutex logMutex;//日志线程锁
 std::condition_variable logCondition;//通知器
 bool logThreadRunning=TRUE;
+void LogThread();
+void LogMessage(const char* format, ...);
+LRESULT CALLBACK AxisButtonProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+LRESULT CALLBACK presButtonProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+void Subclassing(HWND hwnd, WNDPROC tarProc);
+HWND CreateButton(HWND hwnd, const TCHAR* text, int x,int y,int id);
+void CreateGUI(HWND hwnd);
+#pragma endregion
 
-int CheckVJD(int dev_id);
+
+#pragma region Vjoy
+//设备检查
+int CheckVJD(int dev_id)
+{
+    if(!vJoyEnabled())
+    {
+        LogMessage("vJoy has not been enabled!");
+        return -2;
+    }
+    VjdStat status = GetVJDStatus(dev_id);
+    switch (status)
+    {
+        case VJD_STAT_OWN:
+        {
+            LogMessage("vJoy Device %d is already owned.", dev_id);
+            break;
+        }
+        case VJD_STAT_FREE:
+        {
+            LogMessage("vJoy Device %d is free.",dev_id);
+            break;
+        }
+        case VJD_STAT_BUSY:
+        {
+            LogMessage("[ERROR] vJoy Device %d is busy.",dev_id);
+            return -1;
+        }
+        case VJD_STAT_MISS:
+        {
+            LogMessage("[ERROR] vJoy Device %d is missed.",dev_id);
+            return -1;
+        }
+        default:
+        {
+            LogMessage("[ERROR] Unknown error.");
+            return -1;
+        }
+    };
+    
+    BOOL AxisX = GetVJDAxisExist(DEV_ID, HID_USAGE_X);
+    BOOL AxisY = GetVJDAxisExist(DEV_ID, HID_USAGE_Y);
+    if(!AxisX)
+    {
+        LogMessage("[ERROR] AxisX does not exist.");
+        return -1;
+    }
+    if(!AxisY)
+    {
+        LogMessage("[ERROR] AxisY does not exist.");
+        return -1;
+    }
+    int nButtons = GetVJDButtonNumber(dev_id);
+    if(status == VJD_STAT_FREE && !AcquireVJD(dev_id))
+    {
+        LogMessage("[ERROR] Failed to acquire.");
+        return 0;
+    }
+    LogMessage("Acquire successfully.");
+    return 1;
+
+    ResettVJD(DEV_ID);
+    
+}
+
+void ResettVJD(int dev_id)
+{
+    ResetVJD(dev_id);
+    SetAxis(0x4000,DEV_ID,HID_USAGE_X);
+    SetAxis(0x4000,DEV_ID,HID_USAGE_RX);
+    SetAxis(0x4000,DEV_ID,HID_USAGE_Y);
+    SetAxis(0x4000,DEV_ID,HID_USAGE_RY);
+}
+
+void PushAction(const InputAct& Act)
+{
+    {
+        std::lock_guard<std::mutex> lock(inputQueMutex);
+        inputQue.push(Act);
+    }
+    inputCV.notify_one();
+}
+
+void workThreadFunc()
+{
+    std::unique_lock<std::mutex> lock(inputQueMutex);
+    while(inputThreadRunning)
+    {
+        inputCV.wait(lock, []{return !inputQue.empty()||!inputThreadRunning;});
+        while(!inputQue.empty())
+        {
+            InputAct Act = inputQue.front();
+            inputQue.pop();
+            lock.unlock();
+            ActionProc(Act);
+            lock.lock();
+        }
+    }
+}
+
+void ActionProc(InputAct Act)
+{
+    static std::unordered_map<int, int> ButtonMap = {
+        {ID_BTN_X,1}, {ID_BTN_A,2},
+        {ID_BTN_B,3}, {ID_BTN_Y,4},
+        {ID_LT,5}, {ID_RT,6},
+        {ID_BTN_LB,7}, {ID_BTN_RB,8},
+        {ID_LX_LEFT,HID_USAGE_X},
+        {ID_LX_RIGHT,HID_USAGE_X},
+        {ID_LY_UP,HID_USAGE_Y},
+        {ID_LY_DOWN,HID_USAGE_Y}
+    };
+    static std::unordered_map<int, int> ValueMap = {
+        {ID_LX_LEFT,0x1},
+        {ID_LX_RIGHT,0x7000},
+        {ID_LY_UP,0x1},
+        {ID_LY_DOWN,0x7000}
+    };
+    if(Act.type == InputActType::Button)
+    {
+        SetBtn(Act.isPressed?TRUE:FALSE, DEV_ID, ButtonMap[Act.butID]);
+#ifndef NDEBUG
+        LogMessage("Button %d is %s.", ButtonMap[Act.butID], Act.isPressed?"pressed":"released");
+#endif
+
+    }
+    else if(Act.type == InputActType::AxisMove)
+    {
+        SetAxis(Act.isPressed?ValueMap[Act.butID]:0x4000, DEV_ID, ButtonMap[Act.butID]);
+#ifndef NDEBUG
+        LogMessage("Axis %s is %s.", ButtonMap[Act.butID]==HID_USAGE_X?"X":"Y", Act.isPressed?"moving":"stopped");
+#endif
+    }
+
+}
+#pragma endregion
+
+
 
 #pragma region GUI
 
@@ -55,15 +222,14 @@ void LogThread()
         while(!logBuff.empty())
         {
             std::string LogMsg = logBuff.front();
-            lock.unlock();
             logBuff.pop();
+            lock.unlock();
             
             int len = GetWindowTextLength(hLogBox);
             SendMessage(hLogBox, EM_SETSEL, (WPARAM)len, (LPARAM)len);
             SendMessage(hLogBox, EM_REPLACESEL, 0, (LPARAM)LogMsg.c_str());
             SendMessage(hLogBox, EM_REPLACESEL, 0, (LPARAM)_T("\r\n"));
             SendMessage(hLogBox, WM_VSCROLL, SB_BOTTOM, 0);
-
             lock.lock();
         }
     }
@@ -76,7 +242,7 @@ void LogMessage(const char* format, ...)
     char buffer[1024];
     va_list args;
     va_start(args,format);
-    _vsnprintf_s(buffer, sizeof(buffer)/sizeof(wchar_t), _TRUNCATE, format, args); 
+    _vsnprintf_s(buffer, sizeof(buffer), _TRUNCATE, format, args); 
     va_end(args);
     
     {
@@ -95,31 +261,14 @@ LRESULT CALLBACK AxisButtonProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 {
     int buttonID=GetDlgCtrlID(hwnd);
     WNDPROC oldProc = (WNDPROC)GetWindowLongPtr(hwnd, GWLP_USERDATA);
-    static std::unordered_map<int, int> AxisMap = {
-        {ID_LX_LEFT,HID_USAGE_X},
-        {ID_LX_RIGHT,HID_USAGE_X},
-        {ID_LY_UP,HID_USAGE_Y},
-        {ID_LY_DOWN,HID_USAGE_Y}
-    };
-    static std::unordered_map<int, int> ValueMap = {
-        {ID_LX_LEFT,0x1},
-        {ID_LX_RIGHT,0x7000},
-        {ID_LY_UP,0x7000},
-        {ID_LY_DOWN,0x1}
-    };
     switch(msg)
     {
+        case WM_LBUTTONDBLCLK:
         case WM_LBUTTONDOWN:
         {
             if(DEV_USABLE)
             {
-                if(!Btnstate[buttonID])
-                {
-                    Btnstate[buttonID]=TRUE;
-                    SetAxis(ValueMap[buttonID], DEV_ID, AxisMap[buttonID]);
-                    LogMessage("Axis %s is Moving.", AxisMap[buttonID]==HID_USAGE_X?"X":"Y");
-                }
-
+                PushAction({buttonID, TRUE, InputActType::AxisMove});
             }
         }
         break;
@@ -127,12 +276,7 @@ LRESULT CALLBACK AxisButtonProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         {
             if(DEV_USABLE)
             {
-                if(Btnstate[buttonID])
-                {
-                    Btnstate[buttonID]=FALSE;
-                    SetAxis(0x4000, DEV_ID, AxisMap[buttonID]);
-                    LogMessage("Axis %s stop Moving.", AxisMap[buttonID]==HID_USAGE_X?"X":"Y");
-                }
+                PushAction({buttonID, FALSE, InputActType::AxisMove});
             }
         }
         break;
@@ -145,20 +289,14 @@ LRESULT CALLBACK presButtonProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 {
     int buttonID=GetDlgCtrlID(hwnd);
     WNDPROC oldProc = (WNDPROC)GetWindowLongPtr(hwnd, GWLP_USERDATA);
-    static std::unordered_map<int, int> ButtonMap = {
-        {ID_BTN_X,1}, {ID_BTN_A,2},
-        {ID_BTN_B,3}, {ID_BTN_Y,4},
-        {ID_LT,5}, {ID_RT,6},
-        {ID_BTN_LB,7}, {ID_BTN_RB,8}
-    };
     switch (msg)
     {
+        case WM_LBUTTONDBLCLK:
         case WM_LBUTTONDOWN:
         {
             if(DEV_USABLE) 
             {
-                SetBtn(TRUE, DEV_ID, ButtonMap[buttonID]);
-                LogMessage("Button %d is pressed.", ButtonMap[buttonID]);
+                PushAction({buttonID, TRUE, InputActType::Button});
             }
         }
         break;
@@ -166,8 +304,7 @@ LRESULT CALLBACK presButtonProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         {
             if(DEV_USABLE)
             {
-                SetBtn(FALSE, DEV_ID, ButtonMap[buttonID]);
-                LogMessage("Button %d is released.", ButtonMap[buttonID]);
+                PushAction({buttonID, FALSE, InputActType::Button});
             }
         }
         break;
@@ -178,16 +315,22 @@ LRESULT CALLBACK presButtonProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 //设置子类化
 void Subclassing(HWND hwnd, WNDPROC tarProc)
 {
+#ifndef NDEBUG
     LogMessage("Subclassing button %d.",GetDlgCtrlID(hwnd));                        //test
+#endif
     WNDPROC oldProc = (WNDPROC)GetWindowLongPtr(hwnd,GWLP_WNDPROC);
     if(!oldProc)
     {
+#ifndef NDEBUG
         LogMessage("oldProc is NULL!");                                             //test
+#endif
         oldProc = DefWindowProc;
     }
     SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)oldProc);
     SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)tarProc);
+#ifndef NDEBUG
     LogMessage("Subclassed: hwnd=%p, oldProc=%p, tarProc=%p",hwnd, oldProc, tarProc);//test
+#endif
 }
 
 //封装按钮创建
@@ -258,6 +401,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM LParam)
         break;
     case WM_DESTROY:
         {
+            LogMessage("Executing...");
+            ResettVJD(DEV_ID);
             RelinquishVJD(DEV_ID);
             PostQuitMessage(0);
         }
@@ -297,6 +442,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     logThreadRunning=TRUE;
     std::thread logger(LogThread);
+    inputThreadRunning=TRUE;
+    std::thread worker(workThreadFunc);
 
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0))
@@ -307,81 +454,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     if(logThreadRunning)
     {
-        logCondition.notify_one();
         logThreadRunning=FALSE;
+        logCondition.notify_one();
         if(logger.joinable())
         {
             logger.join();
         }
     }
+    if(inputThreadRunning)
+    {
+        inputThreadRunning=FALSE;
+        inputCV.notify_one();
+        if(worker.joinable())
+        {
+            worker.join();
+        }
+    }
     return msg.wParam;
 }
-#pragma endregion
-
-#pragma region Vjoy
-
-int CheckVJD(int dev_id)
-{
-    if(!vJoyEnabled())
-    {
-        LogMessage("vJoy has not been enabled!");
-        return -2;
-    }
-    VjdStat status = GetVJDStatus(dev_id);
-    switch (status)
-    {
-        case VJD_STAT_OWN:
-        {
-            LogMessage("vJoy Device %d is already owned.", dev_id);
-            break;
-        }
-        case VJD_STAT_FREE:
-        {
-            LogMessage("vJoy Device %d is free.",dev_id);
-            break;
-        }
-        case VJD_STAT_BUSY:
-        {
-            LogMessage("[ERROR] vJoy Device %d is busy.",dev_id);
-            return -1;
-        }
-        case VJD_STAT_MISS:
-        {
-            LogMessage("[ERROR] vJoy Device %d is missed.",dev_id);
-            return -1;
-        }
-        default:
-        {
-            LogMessage("[ERROR] Unknown error.");
-            return -1;
-        }
-    };
-    
-    BOOL AxisX = GetVJDAxisExist(DEV_ID, HID_USAGE_X);
-    BOOL AxisY = GetVJDAxisExist(DEV_ID, HID_USAGE_Y);
-    if(!AxisX)
-    {
-        LogMessage("[ERROR] AxisX does not exist.");
-        return -1;
-    }
-    if(!AxisY)
-    {
-        LogMessage("[ERROR] AxisY does not exist.");
-        return -1;
-    }
-    int nButtons = GetVJDButtonNumber(dev_id);
-    if(status == VJD_STAT_FREE && !AcquireVJD(dev_id))
-    {
-        LogMessage("[ERROR] Failed to acquire.");
-        return 0;
-    }
-    LogMessage("Acquire successfully.");
-    ResetVJD(dev_id);
-    SetAxis(0x4000,DEV_ID,HID_USAGE_X);
-    SetAxis(0x4000,DEV_ID,HID_USAGE_RX);
-    SetAxis(0x4000,DEV_ID,HID_USAGE_Y);
-    SetAxis(0x4000,DEV_ID,HID_USAGE_RY);
-    return 1;
-}
-
 #pragma endregion
